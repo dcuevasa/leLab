@@ -48,9 +48,9 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 FRONTEND_PATH = PROJECT_ROOT / "frontend"
 FRONTEND_DIST = FRONTEND_PATH / "dist"
 FRONTEND_NODE_MODULES = FRONTEND_PATH / "node_modules"
-HOST = "127.0.0.1"
-BACKEND_PORT = 8000
-FRONTEND_DEV_PORT = 8080
+HOST = os.environ.get("LELAB_HOST", os.environ.get("HOST", "127.0.0.1"))
+BACKEND_PORT = int(os.environ.get("LELAB_PORT", os.environ.get("PORT", "8000")))
+FRONTEND_DEV_PORT = int(os.environ.get("LELAB_DEV_PORT", "8080"))
 
 
 def _fail(message: str) -> NoReturn:
@@ -297,13 +297,14 @@ def _open_browser_url(url: str, no_open: bool) -> None:
     webbrowser.open(url)
 
 
-def _open_browser_when_ready(port: int, no_open: bool) -> None:
+def _open_browser_when_ready(port: int, no_open: bool, host: str = "127.0.0.1") -> None:
     if no_open:
         logger.info("Browser launch disabled. Open http://localhost:%d/ when ready.", port)
         return
 
+    check_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
     for _ in range(60):
-        if _is_port_open(port):
+        if _is_port_open(port, host=check_host):
             _open_browser_url(f"http://localhost:{port}/", no_open=False)
             return
         time.sleep(0.5)
@@ -330,20 +331,20 @@ def _monitor_processes(processes: Sequence[tuple[str, subprocess.Popen]]) -> Non
                 raise SystemExit(returncode)
 
 
-def _run_prod(*, no_open: bool = False, rebuild: bool = False) -> None:
+def _run_prod(*, host: str = HOST, port: int = BACKEND_PORT, no_open: bool = False, rebuild: bool = False) -> None:
     """Serve built frontend from backend on a single port."""
-    _ensure_port_available("Backend", BACKEND_PORT)
+    _ensure_port_available("Backend", port)
     if rebuild:
         _run_frontend_build()
     _ensure_frontend_dist()
 
-    logger.info("Starting LeLab on http://localhost:%d ...", BACKEND_PORT)
-    threading.Thread(target=_open_browser_when_ready, args=(BACKEND_PORT, no_open), daemon=True).start()
+    logger.info("Starting LeLab on http://%s:%d ...", host, port)
+    threading.Thread(target=_open_browser_when_ready, args=(port, no_open), daemon=True).start()
 
     config = uvicorn.Config(
         "lelab.server:app",
-        host=HOST,
-        port=BACKEND_PORT,
+        host=host,
+        port=port,
         log_level="info",
         reload=False,
         timeout_graceful_shutdown=2,
@@ -387,22 +388,22 @@ def _run_prod(*, no_open: bool = False, rebuild: bool = False) -> None:
     server.run()
 
 
-def _run_dev(*, no_open: bool = False) -> None:
+def _run_dev(*, host: str = HOST, port: int = BACKEND_PORT, no_open: bool = False) -> None:
     """Start Vite HMR plus uvicorn reload."""
     _ensure_frontend_path()
     _require_command("node")
     _require_command("npm")
-    _ensure_port_available("Backend", BACKEND_PORT)
+    _ensure_port_available("Backend", port)
     _ensure_port_available("Frontend", FRONTEND_DEV_PORT)
     _ensure_frontend_deps()
 
     processes: list[tuple[str, subprocess.Popen]] = []
-    frontend_url = f"http://localhost:{FRONTEND_DEV_PORT}/?api=http://localhost:{BACKEND_PORT}"
+    frontend_url = f"http://localhost:{FRONTEND_DEV_PORT}/?api=http://localhost:{port}"
 
     try:
         frontend_process = _start_process(
             "frontend",
-            ["npm", "run", "dev", "--", "--host", HOST, "--port", str(FRONTEND_DEV_PORT)],
+            ["npm", "run", "dev", "--", "--host", host, "--port", str(FRONTEND_DEV_PORT)],
             FRONTEND_PATH,
         )
         processes.append(("frontend", frontend_process))
@@ -421,9 +422,9 @@ def _run_dev(*, no_open: bool = False) -> None:
                 "uvicorn",
                 "lelab.server:app",
                 "--host",
-                HOST,
+                host,
                 "--port",
-                str(BACKEND_PORT),
+                str(port),
                 "--reload",
                 # Same as prod: an open /camera-feed stream would otherwise
                 # hold off the shutdown hook that saves an active recording.
@@ -434,17 +435,17 @@ def _run_dev(*, no_open: bool = False) -> None:
             env=os.environ.copy(),
         )
         processes.append(("backend", backend_process))
-        if not _wait_for_port(BACKEND_PORT, timeout=15):
+        if not _wait_for_port(port, timeout=15):
             if backend_process.poll() is not None:
                 _fail(
                     f"Backend exited early with code {backend_process.returncode}. Check the uvicorn output above."
                 )
-            _fail(f"Backend never became ready on http://localhost:{BACKEND_PORT}.")
+            _fail(f"Backend never became ready on http://localhost:{port}.")
 
         _open_browser_url(frontend_url, no_open=no_open)
         logger.info("Dev mode running. Press Ctrl+C to stop.")
         logger.info("Frontend: http://localhost:%d", FRONTEND_DEV_PORT)
-        logger.info("Backend:  http://localhost:%d", BACKEND_PORT)
+        logger.info("Backend:  http://localhost:%d", port)
         _install_signal_handlers()
         _monitor_processes(processes)
     except BaseException:
@@ -455,6 +456,18 @@ def _run_dev(*, no_open: bool = False) -> None:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="lelab", description="Run LeLab")
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=HOST,
+        help="Host interface to bind to (default: 127.0.0.1, or $HOST / $LELAB_HOST).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=BACKEND_PORT,
+        help="Port to listen on (default: 8000, or $PORT / $LELAB_PORT).",
+    )
     parser.add_argument(
         "--dev",
         action="store_true",
@@ -490,9 +503,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         parser.error("--rebuild is for production mode; dev mode serves from Vite.")
 
     if args.dev:
-        _run_dev(no_open=args.no_open)
+        _run_dev(host=args.host, port=args.port, no_open=args.no_open)
     else:
-        _run_prod(no_open=args.no_open, rebuild=args.rebuild)
+        _run_prod(host=args.host, port=args.port, no_open=args.no_open, rebuild=args.rebuild)
 
 
 if __name__ == "__main__":
