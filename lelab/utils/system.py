@@ -46,8 +46,8 @@ def _build_install_cmd(package: str) -> list[str]:
     Otherwise fall back to `python -m pip`.
     """
     if shutil.which("uv"):
-        return ["uv", "pip", "install", "--python", sys.executable, package]
-    return [sys.executable, "-m", "pip", "install", package]
+        return ["uv", "pip", "install", "--break-system-packages", "--python", sys.executable, package]
+    return [sys.executable, "-m", "pip", "install", "--user", package]
 
 
 class ExtraStatus(BaseModel):
